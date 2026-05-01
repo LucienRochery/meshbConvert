@@ -10,6 +10,34 @@ extern "C" {
 #include <libmeshb7.h>
 }
 
+static uint32_t bswap32(uint32_t v)
+{
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8)
+         | ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24);
+}
+
+static uint64_t bswap64(uint64_t v)
+{
+    return ((v & 0x00000000000000FFull) << 56) | ((v & 0x000000000000FF00ull) << 40)
+         | ((v & 0x0000000000FF0000ull) << 24) | ((v & 0x00000000FF000000ull) << 8)
+         | ((v & 0x000000FF00000000ull) >> 8)  | ((v & 0x0000FF0000000000ull) >> 24)
+         | ((v & 0x00FF000000000000ull) >> 40) | ((v & 0xFF00000000000000ull) >> 56);
+}
+
+static void swapInts(int32_t *p, size_t n)
+{
+    for (size_t ii = 0; ii < n; ii++) {
+        uint32_t u; memcpy(&u, &p[ii], 4); u = bswap32(u); memcpy(&p[ii], &u, 4);
+    }
+}
+
+static void swapDoubles(double *p, size_t n)
+{
+    for (size_t ii = 0; ii < n; ii++) {
+        uint64_t u; memcpy(&u, &p[ii], 8); u = bswap64(u); memcpy(&p[ii], &u, 8);
+    }
+}
+
 static uint64_t edgeKey(int va, int vb)
 {
     uint32_t lo = (uint32_t)(va < vb ? va : vb);
@@ -54,12 +82,17 @@ static int ugridToMeshb(const char *inputFile, const char *outputFile)
     FILE *fp = fopen(inputFile, "rb");
     if (!fp) { fprintf(stderr, "Cannot open %s\n", inputFile); return 1; }
 
+    // .b8.ugrid is big-endian; .lb8.ugrid (and bare .ugrid) is little-endian.
+    bool swap = endsWith(inputFile, ".b8.ugrid") && !endsWith(inputFile, ".lb8.ugrid");
+    if (swap) printf("Detected big-endian (.b8.ugrid); byte-swapping on read\n");
+
     int32_t header[7];
     if (fread(header, sizeof(int32_t), 7, fp) != 7) {
         fprintf(stderr, "Failed to read UGRID header\n");
         fclose(fp);
         return 1;
     }
+    if (swap) swapInts(header, 7);
     int nNodes = header[0], nTri = header[1], nQuad = header[2];
     int nTet = header[3], nPyr = header[4], nPrism = header[5], nHex = header[6];
 
@@ -70,15 +103,19 @@ static int ugridToMeshb(const char *inputFile, const char *outputFile)
     for (int ii = 0; ii < nNodes; ii++) {
         double xyz[3];
         fread(xyz, sizeof(double), 3, fp);
+        if (swap) swapDoubles(xyz, 3);
         vx[ii] = xyz[0]; vy[ii] = xyz[1]; vz[ii] = xyz[2];
     }
 
     std::vector<int32_t> triConn(nTri * 3);
     fread(triConn.data(), sizeof(int32_t), nTri * 3, fp);
+    if (swap) swapInts(triConn.data(), triConn.size());
 
     std::vector<int32_t> quadConn(nQuad * 4);
-    if (nQuad > 0)
+    if (nQuad > 0) {
         fread(quadConn.data(), sizeof(int32_t), nQuad * 4, fp);
+        if (swap) swapInts(quadConn.data(), quadConn.size());
+    }
 
     // Skip volume elements
     fseek(fp, (long)nTet * 4 * sizeof(int32_t), SEEK_CUR);
@@ -88,6 +125,7 @@ static int ugridToMeshb(const char *inputFile, const char *outputFile)
 
     std::vector<int32_t> surfIds(nTri + nQuad);
     fread(surfIds.data(), sizeof(int32_t), nTri + nQuad, fp);
+    if (swap) swapInts(surfIds.data(), surfIds.size());
     fclose(fp);
 
     // Build triangle adjacency, extract boundary edges
