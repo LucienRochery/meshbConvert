@@ -117,15 +117,14 @@ static int ugridToMeshb(const char *inputFile, const char *outputFile)
         if (swap) swapInts(quadConn.data(), quadConn.size());
     }
 
-    // Skip volume elements
-    fseek(fp, (long)nTet * 4 * sizeof(int32_t), SEEK_CUR);
-    fseek(fp, (long)nPyr * 5 * sizeof(int32_t), SEEK_CUR);
-    fseek(fp, (long)nPrism * 6 * sizeof(int32_t), SEEK_CUR);
-    fseek(fp, (long)nHex * 8 * sizeof(int32_t), SEEK_CUR);
-
+    // Surface ID flags come immediately after surface connectivity in AFLR3 .ugrid
     std::vector<int32_t> surfIds(nTri + nQuad);
-    fread(surfIds.data(), sizeof(int32_t), nTri + nQuad, fp);
-    if (swap) swapInts(surfIds.data(), surfIds.size());
+    if (nTri + nQuad > 0) {
+        fread(surfIds.data(), sizeof(int32_t), nTri + nQuad, fp);
+        if (swap) swapInts(surfIds.data(), surfIds.size());
+    }
+
+    // Volume elements follow; ugrid -> meshb does not consume them
     fclose(fp);
 
     // Build triangle adjacency, extract boundary edges
@@ -367,6 +366,14 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
     fwrite(triConn.data(), sizeof(int32_t), nTri * 3, fp);
     if (nQuad > 0)
         fwrite(quadConn.data(), sizeof(int32_t), nQuad * 4, fp);
+
+    // Surface IDs (tri refs then quad refs) come before volume connectivity
+    // per AFLR3 .ugrid layout
+    for (int64_t ii = 0; ii < nTri; ii++)
+        fwrite(&triRef[ii], sizeof(int32_t), 1, fp);
+    for (int64_t ii = 0; ii < nQuad; ii++)
+        fwrite(&quadRef[ii], sizeof(int32_t), 1, fp);
+
     if (nTet > 0)
         fwrite(tetConn.data(), sizeof(int32_t), nTet * 4, fp);
     if (nPyr > 0)
@@ -375,12 +382,6 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
         fwrite(prismConn.data(), sizeof(int32_t), nPrism * 6, fp);
     if (nHex > 0)
         fwrite(hexConn.data(), sizeof(int32_t), nHex * 8, fp);
-
-    // Surface IDs: tri refs then quad refs
-    for (int64_t ii = 0; ii < nTri; ii++)
-        fwrite(&triRef[ii], sizeof(int32_t), 1, fp);
-    for (int64_t ii = 0; ii < nQuad; ii++)
-        fwrite(&quadRef[ii], sizeof(int32_t), 1, fp);
 
     fclose(fp);
     printf("Wrote %s\n", outputFile);
