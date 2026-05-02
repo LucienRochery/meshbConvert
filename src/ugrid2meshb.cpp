@@ -228,9 +228,18 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
     int64_t fh = GmfOpenMesh(inputFile, GmfRead, &dim, &dim);
     if (!fh) { fprintf(stderr, "Cannot open %s\n", inputFile); return 1; }
 
-    int64_t nNodes = GmfStatKwd(fh, GmfVertices);
-    int64_t nTri   = GmfStatKwd(fh, GmfTriangles);
-    int64_t nQuad  = GmfStatKwd(fh, GmfQuadrilaterals);
+    int64_t nNodes   = GmfStatKwd(fh, GmfVertices);
+    int64_t nTri     = GmfStatKwd(fh, GmfTriangles);
+    int64_t nQuad    = GmfStatKwd(fh, GmfQuadrilaterals);
+    int64_t nTet     = GmfStatKwd(fh, GmfTetrahedra);
+    int64_t nCorner  = GmfStatKwd(fh, GmfCorners);
+    int64_t nEdge    = GmfStatKwd(fh, GmfEdges);
+    int64_t nPyr     = GmfStatKwd(fh, GmfPyramids);
+    int64_t nPrism   = GmfStatKwd(fh, GmfPrisms);
+    int64_t nHex     = GmfStatKwd(fh, GmfHexahedra);
+
+    if (nCorner > 0) printf("warning, element type not supported Corners\n");
+    if (nEdge   > 0) printf("warning, element type not supported Edges\n");
 
     std::vector<double> vx(nNodes), vy(nNodes), vz(nNodes);
     GmfGotoKwd(fh, GmfVertices);
@@ -262,9 +271,60 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
         }
     }
 
+    std::vector<int32_t> tetConn(nTet * 4);
+    if (nTet > 0) {
+        GmfGotoKwd(fh, GmfTetrahedra);
+        for (int64_t ii = 0; ii < nTet; ii++) {
+            int va, vb, vc, vd, ref;
+            GmfGetLin(fh, GmfTetrahedra, &va, &vb, &vc, &vd, &ref);
+            tetConn[ii * 4] = va; tetConn[ii * 4 + 1] = vb;
+            tetConn[ii * 4 + 2] = vc; tetConn[ii * 4 + 3] = vd;
+        }
+    }
+
+    std::vector<int32_t> pyrConn(nPyr * 5);
+    if (nPyr > 0) {
+        GmfGotoKwd(fh, GmfPyramids);
+        for (int64_t ii = 0; ii < nPyr; ii++) {
+            int va, vb, vc, vd, ve, ref;
+            GmfGetLin(fh, GmfPyramids, &va, &vb, &vc, &vd, &ve, &ref);
+            pyrConn[ii * 5]     = va; pyrConn[ii * 5 + 1] = vb;
+            pyrConn[ii * 5 + 2] = vc; pyrConn[ii * 5 + 3] = vd;
+            pyrConn[ii * 5 + 4] = ve;
+        }
+    }
+
+    std::vector<int32_t> prismConn(nPrism * 6);
+    if (nPrism > 0) {
+        GmfGotoKwd(fh, GmfPrisms);
+        for (int64_t ii = 0; ii < nPrism; ii++) {
+            int va, vb, vc, vd, ve, vf, ref;
+            GmfGetLin(fh, GmfPrisms, &va, &vb, &vc, &vd, &ve, &vf, &ref);
+            prismConn[ii * 6]     = va; prismConn[ii * 6 + 1] = vb;
+            prismConn[ii * 6 + 2] = vc; prismConn[ii * 6 + 3] = vd;
+            prismConn[ii * 6 + 4] = ve; prismConn[ii * 6 + 5] = vf;
+        }
+    }
+
+    std::vector<int32_t> hexConn(nHex * 8);
+    if (nHex > 0) {
+        GmfGotoKwd(fh, GmfHexahedra);
+        for (int64_t ii = 0; ii < nHex; ii++) {
+            int va, vb, vc, vd, ve, vf, vg, vh, ref;
+            GmfGetLin(fh, GmfHexahedra,
+                      &va, &vb, &vc, &vd, &ve, &vf, &vg, &vh, &ref);
+            hexConn[ii * 8]     = va; hexConn[ii * 8 + 1] = vb;
+            hexConn[ii * 8 + 2] = vc; hexConn[ii * 8 + 3] = vd;
+            hexConn[ii * 8 + 4] = ve; hexConn[ii * 8 + 5] = vf;
+            hexConn[ii * 8 + 6] = vg; hexConn[ii * 8 + 7] = vh;
+        }
+    }
+
     GmfCloseMesh(fh);
 
-    printf("meshb: %ld nodes, %ld tris, %ld quads\n", (long)nNodes, (long)nTri, (long)nQuad);
+    printf("meshb: %ld nodes, %ld tris, %ld quads, %ld tets, %ld pyrs, %ld prisms, %ld hexes\n",
+           (long)nNodes, (long)nTri, (long)nQuad,
+           (long)nTet, (long)nPyr, (long)nPrism, (long)nHex);
 
     // Compact refs to 1..N (sorted by original ref) so the ugrid surface IDs
     // and the .mapbc patch list are sequential and consistent.
@@ -294,7 +354,9 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
     FILE *fp = fopen(outputFile, "wb");
     if (!fp) { fprintf(stderr, "Cannot open %s for writing\n", outputFile); return 1; }
 
-    int32_t header[7] = { (int32_t)nNodes, (int32_t)nTri, (int32_t)nQuad, 0, 0, 0, 0 };
+    int32_t header[7] = { (int32_t)nNodes, (int32_t)nTri, (int32_t)nQuad,
+                          (int32_t)nTet, (int32_t)nPyr,
+                          (int32_t)nPrism, (int32_t)nHex };
     fwrite(header, sizeof(int32_t), 7, fp);
 
     for (int64_t ii = 0; ii < nNodes; ii++) {
@@ -305,6 +367,14 @@ static int meshbToUgrid(const char *inputFile, const char *outputFile)
     fwrite(triConn.data(), sizeof(int32_t), nTri * 3, fp);
     if (nQuad > 0)
         fwrite(quadConn.data(), sizeof(int32_t), nQuad * 4, fp);
+    if (nTet > 0)
+        fwrite(tetConn.data(), sizeof(int32_t), nTet * 4, fp);
+    if (nPyr > 0)
+        fwrite(pyrConn.data(), sizeof(int32_t), nPyr * 5, fp);
+    if (nPrism > 0)
+        fwrite(prismConn.data(), sizeof(int32_t), nPrism * 6, fp);
+    if (nHex > 0)
+        fwrite(hexConn.data(), sizeof(int32_t), nHex * 8, fp);
 
     // Surface IDs: tri refs then quad refs
     for (int64_t ii = 0; ii < nTri; ii++)
