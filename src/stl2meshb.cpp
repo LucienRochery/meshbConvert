@@ -87,6 +87,8 @@ static void printUsage(const char *prog)
     printf("\n");
     printf("meshb to STL:\n");
     printf("  - Writes binary STL from meshb triangles\n");
+    printf("  - Quads are split into two triangles\n");
+    printf("  - Other element types (corners, edges, volumes) are dropped with a warning\n");
 }
 
 // ---- STL to meshb ----
@@ -246,8 +248,22 @@ static int meshbToStl(const char *inputFile, const char *outputFile)
     int64_t fh = GmfOpenMesh(inputFile, GmfRead, &dim, &dim);
     if (!fh) { fprintf(stderr, "Cannot open %s\n", inputFile); return 1; }
 
-    int64_t nVerts = GmfStatKwd(fh, GmfVertices);
-    int64_t nTris  = GmfStatKwd(fh, GmfTriangles);
+    int64_t nVerts  = GmfStatKwd(fh, GmfVertices);
+    int64_t nTris   = GmfStatKwd(fh, GmfTriangles);
+    int64_t nQuads  = GmfStatKwd(fh, GmfQuadrilaterals);
+    int64_t nCorner = GmfStatKwd(fh, GmfCorners);
+    int64_t nEdge   = GmfStatKwd(fh, GmfEdges);
+    int64_t nTet    = GmfStatKwd(fh, GmfTetrahedra);
+    int64_t nPyr    = GmfStatKwd(fh, GmfPyramids);
+    int64_t nPrism  = GmfStatKwd(fh, GmfPrisms);
+    int64_t nHex    = GmfStatKwd(fh, GmfHexahedra);
+
+    if (nCorner > 0) printf("warning, element type not supported Corners\n");
+    if (nEdge   > 0) printf("warning, element type not supported Edges\n");
+    if (nTet    > 0) printf("warning, element type not supported Tetrahedra\n");
+    if (nPyr    > 0) printf("warning, element type not supported Pyramids\n");
+    if (nPrism  > 0) printf("warning, element type not supported Prisms\n");
+    if (nHex    > 0) printf("warning, element type not supported Hexahedra\n");
 
     std::vector<double> vx(nVerts), vy(nVerts), vz(nVerts);
     GmfGotoKwd(fh, GmfVertices);
@@ -257,12 +273,24 @@ static int meshbToStl(const char *inputFile, const char *outputFile)
     }
 
     std::vector<int> t0(nTris), t1(nTris), t2(nTris), tRef(nTris);
-    GmfGotoKwd(fh, GmfTriangles);
-    for (int64_t ii = 0; ii < nTris; ii++)
-        GmfGetLin(fh, GmfTriangles, &t0[ii], &t1[ii], &t2[ii], &tRef[ii]);
+    if (nTris > 0) {
+        GmfGotoKwd(fh, GmfTriangles);
+        for (int64_t ii = 0; ii < nTris; ii++)
+            GmfGetLin(fh, GmfTriangles, &t0[ii], &t1[ii], &t2[ii], &tRef[ii]);
+    }
+
+    std::vector<int> q0(nQuads), q1(nQuads), q2(nQuads), q3(nQuads), qRef(nQuads);
+    if (nQuads > 0) {
+        GmfGotoKwd(fh, GmfQuadrilaterals);
+        for (int64_t ii = 0; ii < nQuads; ii++)
+            GmfGetLin(fh, GmfQuadrilaterals,
+                      &q0[ii], &q1[ii], &q2[ii], &q3[ii], &qRef[ii]);
+    }
+
     GmfCloseMesh(fh);
 
-    printf("Read %ld vertices, %ld triangles\n", (long)nVerts, (long)nTris);
+    printf("Read %ld vertices, %ld triangles, %ld quads\n",
+           (long)nVerts, (long)nTris, (long)nQuads);
 
     // Write binary STL
     FILE *fp = fopen(outputFile, "wb");
@@ -271,11 +299,10 @@ static int meshbToStl(const char *inputFile, const char *outputFile)
     char header[80] = {};
     snprintf(header, 80, "Binary STL from %s", inputFile);
     fwrite(header, 1, 80, fp);
-    uint32_t nTriOut = (uint32_t)nTris;
+    uint32_t nTriOut = (uint32_t)(nTris + 2 * nQuads);
     fwrite(&nTriOut, 4, 1, fp);
 
-    for (int64_t ii = 0; ii < nTris; ii++) {
-        int ia = t0[ii] - 1, ib = t1[ii] - 1, ic = t2[ii] - 1; // meshb is 1-indexed
+    auto writeTri = [&](int ia, int ib, int ic, int ref) {
         double ax = vx[ib] - vx[ia], ay = vy[ib] - vy[ia], az = vz[ib] - vz[ia];
         double bx = vx[ic] - vx[ia], by = vy[ic] - vy[ia], bz = vz[ic] - vz[ia];
         float nx = (float)(ay * bz - az * by);
@@ -290,8 +317,17 @@ static int meshbToStl(const char *inputFile, const char *outputFile)
             (float)vx[ic], (float)vy[ic], (float)vz[ic]
         };
         fwrite(verts, sizeof(float), 9, fp);
-        uint16_t attr = (uint16_t)tRef[ii];
+        uint16_t attr = (uint16_t)ref;
         fwrite(&attr, 2, 1, fp);
+    };
+
+    for (int64_t ii = 0; ii < nTris; ii++)
+        writeTri(t0[ii] - 1, t1[ii] - 1, t2[ii] - 1, tRef[ii]);
+
+    for (int64_t ii = 0; ii < nQuads; ii++) {
+        int ia = q0[ii] - 1, ib = q1[ii] - 1, ic = q2[ii] - 1, id = q3[ii] - 1;
+        writeTri(ia, ib, ic, qRef[ii]);
+        writeTri(ia, ic, id, qRef[ii]);
     }
 
     fclose(fp);
