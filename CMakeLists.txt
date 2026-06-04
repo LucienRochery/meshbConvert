@@ -12,8 +12,5 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libMeshb)
 
-add_executable(stl2meshb src/stl2meshb.cpp)
-target_link_libraries(stl2meshb PRIVATE Meshb.7)
-
-add_executable(ugrid2meshb src/ugrid2meshb.cpp)
-target_link_libraries(ugrid2meshb PRIVATE Meshb.7)
+add_executable(meshConvert src/meshConvert.cpp)
+target_link_libraries(meshConvert PRIVATE Meshb.7)
