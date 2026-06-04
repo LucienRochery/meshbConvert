@@ -462,16 +462,49 @@ static int writeMeshb(const char *outputFile, const Mesh &mm)
 // UGRID (lb8.ugrid: little-endian, 8-byte doubles, 4-byte ints)
 // ============================================================
 
+static uint32_t bswap32(uint32_t vv)
+{
+    return ((vv & 0x000000FFu) << 24) | ((vv & 0x0000FF00u) << 8)
+         | ((vv & 0x00FF0000u) >> 8)  | ((vv & 0xFF000000u) >> 24);
+}
+
+static uint64_t bswap64(uint64_t vv)
+{
+    return ((vv & 0x00000000000000FFull) << 56) | ((vv & 0x000000000000FF00ull) << 40)
+         | ((vv & 0x0000000000FF0000ull) << 24) | ((vv & 0x00000000FF000000ull) << 8)
+         | ((vv & 0x000000FF00000000ull) >> 8)  | ((vv & 0x0000FF0000000000ull) >> 24)
+         | ((vv & 0x00FF000000000000ull) >> 40) | ((vv & 0xFF00000000000000ull) >> 56);
+}
+
+static void swapInts(int32_t *pp, size_t nn)
+{
+    for (size_t ii = 0; ii < nn; ii++) {
+        uint32_t uu; memcpy(&uu, &pp[ii], 4); uu = bswap32(uu); memcpy(&pp[ii], &uu, 4);
+    }
+}
+
+static void swapDoubles(double *pp, size_t nn)
+{
+    for (size_t ii = 0; ii < nn; ii++) {
+        uint64_t uu; memcpy(&uu, &pp[ii], 8); uu = bswap64(uu); memcpy(&pp[ii], &uu, 8);
+    }
+}
+
 static int readUgrid(const char *inputFile, Mesh &mm)
 {
     FILE *fp = fopen(inputFile, "rb");
     if (!fp) { fprintf(stderr, "Cannot open %s\n", inputFile); return 1; }
+
+    // .b8.ugrid is big-endian; .lb8.ugrid (and bare .ugrid) is little-endian.
+    bool swap = endsWith(inputFile, ".b8.ugrid") && !endsWith(inputFile, ".lb8.ugrid");
+    if (swap) printf("Detected big-endian (.b8.ugrid); byte-swapping on read\n");
 
     int32_t header[7];
     if (fread(header, sizeof(int32_t), 7, fp) != 7) {
         fprintf(stderr, "Failed to read UGRID header\n");
         fclose(fp); return 1;
     }
+    if (swap) swapInts(header, 7);
     int nNodes = header[0], nTri = header[1], nQuad = header[2];
     int nTet = header[3], nPyr = header[4], nPrism = header[5], nHex = header[6];
     printf("UGRID: %d nodes, %d tris, %d quads, %d tets, %d pyrs, %d prisms, %d hexes\n",
@@ -480,6 +513,7 @@ static int readUgrid(const char *inputFile, Mesh &mm)
     mm.x.resize(nNodes); mm.y.resize(nNodes); mm.z.resize(nNodes);
     for (int ii = 0; ii < nNodes; ii++) {
         double xyz[3]; fread(xyz, sizeof(double), 3, fp);
+        if (swap) swapDoubles(xyz, 3);
         mm.x[ii] = xyz[0]; mm.y[ii] = xyz[1]; mm.z[ii] = xyz[2];
     }
 
@@ -487,18 +521,24 @@ static int readUgrid(const char *inputFile, Mesh &mm)
         if (nElt <= 0) return;
         std::vector<int32_t> tmp(nElt * stride);
         fread(tmp.data(), sizeof(int32_t), nElt * stride, fp);
+        if (swap) swapInts(tmp.data(), tmp.size());
         outConn.resize(nElt * stride);
         for (size_t ii = 0; ii < tmp.size(); ii++) outConn[ii] = tmp[ii] - 1;
     };
-    readConn(nTri,   3, mm.triConn);
-    readConn(nQuad,  4, mm.quadConn);
+    // AFLR3 .ugrid layout: surface connectivity, then surface ID flags, then volumes.
+    readConn(nTri,  3, mm.triConn);
+    readConn(nQuad, 4, mm.quadConn);
+
+    std::vector<int32_t> surfIds(nTri + nQuad);
+    if (nTri + nQuad > 0) {
+        fread(surfIds.data(), sizeof(int32_t), nTri + nQuad, fp);
+        if (swap) swapInts(surfIds.data(), surfIds.size());
+    }
+
     readConn(nTet,   4, mm.tetConn);
     readConn(nPyr,   5, mm.pyrConn);
     readConn(nPrism, 6, mm.prismConn);
     readConn(nHex,   8, mm.hexConn);
-
-    std::vector<int32_t> surfIds(nTri + nQuad);
-    fread(surfIds.data(), sizeof(int32_t), nTri + nQuad, fp);
     fclose(fp);
 
     mm.triRef.assign(nTri, 0);
@@ -546,12 +586,9 @@ static int writeUgrid(const char *outputFile, const Mesh &mm)
         for (size_t ii = 0; ii < conn.size(); ii++) oneBased[ii] = conn[ii] + 1;
         fwrite(oneBased.data(), sizeof(int32_t), oneBased.size(), fp);
     };
+    // AFLR3 .ugrid layout: surface connectivity, then surface ID flags, then volumes.
     dumpConn(mm.triConn);
     dumpConn(mm.quadConn);
-    dumpConn(mm.tetConn);
-    dumpConn(mm.pyrConn);
-    dumpConn(mm.prismConn);
-    dumpConn(mm.hexConn);
 
     for (int ii = 0; ii < mm.nTri(); ii++) {
         int32_t rr = remap[mm.triRef.empty() ? 0 : mm.triRef[ii]];
@@ -561,6 +598,11 @@ static int writeUgrid(const char *outputFile, const Mesh &mm)
         int32_t rr = remap[mm.quadRef.empty() ? 0 : mm.quadRef[ii]];
         fwrite(&rr, sizeof(int32_t), 1, fp);
     }
+
+    dumpConn(mm.tetConn);
+    dumpConn(mm.pyrConn);
+    dumpConn(mm.prismConn);
+    dumpConn(mm.hexConn);
     fclose(fp);
     printf("Wrote %s\n", outputFile);
 
