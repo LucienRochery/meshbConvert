@@ -631,6 +631,43 @@ static int writeUgrid(const char *outputFile, const Mesh &mm)
 }
 
 // ============================================================
+// VTK cell dispatch (shared by VTU and legacy VTK readers)
+// ============================================================
+// Appends one cell of the given VTK cell type to the mesh.
+// Returns false if the type/arity is unsupported (caller counts it unhandled).
+static bool addVtkCell(Mesh &mm, int cellType, int nn, const int64_t *vv, int rr)
+{
+    switch (cellType) {
+        case 5:  // VTK_TRIANGLE
+            if (nn != 3) return false;
+            for (int kk = 0; kk < 3; kk++) mm.triConn.push_back((int)vv[kk]);
+            mm.triRef.push_back(rr); return true;
+        case 9:  // VTK_QUAD
+            if (nn != 4) return false;
+            for (int kk = 0; kk < 4; kk++) mm.quadConn.push_back((int)vv[kk]);
+            mm.quadRef.push_back(rr); return true;
+        case 10: // VTK_TETRA
+            if (nn != 4) return false;
+            for (int kk = 0; kk < 4; kk++) mm.tetConn.push_back((int)vv[kk]);
+            mm.tetRef.push_back(rr); return true;
+        case 14: // VTK_PYRAMID
+            if (nn != 5) return false;
+            for (int kk = 0; kk < 5; kk++) mm.pyrConn.push_back((int)vv[kk]);
+            mm.pyrRef.push_back(rr); return true;
+        case 13: // VTK_WEDGE (prism)
+            if (nn != 6) return false;
+            for (int kk = 0; kk < 6; kk++) mm.prismConn.push_back((int)vv[kk]);
+            mm.prismRef.push_back(rr); return true;
+        case 12: // VTK_HEXAHEDRON
+            if (nn != 8) return false;
+            for (int kk = 0; kk < 8; kk++) mm.hexConn.push_back((int)vv[kk]);
+            mm.hexRef.push_back(rr); return true;
+        default:
+            return false;
+    }
+}
+
+// ============================================================
 // VTU (VTK UnstructuredGrid XML)
 // ============================================================
 // Supports format="ascii" and format="binary" (inline base64, uncompressed).
@@ -947,51 +984,8 @@ static int readVtu(const char *inputFile, Mesh &mm)
     for (int ii = 0; ii < nCells; ii++) {
         int64_t cur = offsets[ii];
         int nn = (int)(cur - prev);
-        const int64_t *vv = &conn[prev];
         int rr = hasRefs ? cellRefs[ii] : 0;
-        switch (cellTypes[ii]) {
-            case 5: // VTK_TRIANGLE
-                if (nn == 3) {
-                    mm.triConn.push_back((int)vv[0]);
-                    mm.triConn.push_back((int)vv[1]);
-                    mm.triConn.push_back((int)vv[2]);
-                    mm.triRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            case 9: // VTK_QUAD
-                if (nn == 4) {
-                    for (int kk = 0; kk < 4; kk++) mm.quadConn.push_back((int)vv[kk]);
-                    mm.quadRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            case 10: // VTK_TETRA
-                if (nn == 4) {
-                    for (int kk = 0; kk < 4; kk++) mm.tetConn.push_back((int)vv[kk]);
-                    mm.tetRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            case 14: // VTK_PYRAMID
-                if (nn == 5) {
-                    for (int kk = 0; kk < 5; kk++) mm.pyrConn.push_back((int)vv[kk]);
-                    mm.pyrRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            case 13: // VTK_WEDGE (prism)
-                if (nn == 6) {
-                    for (int kk = 0; kk < 6; kk++) mm.prismConn.push_back((int)vv[kk]);
-                    mm.prismRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            case 12: // VTK_HEXAHEDRON
-                if (nn == 8) {
-                    for (int kk = 0; kk < 8; kk++) mm.hexConn.push_back((int)vv[kk]);
-                    mm.hexRef.push_back(rr);
-                } else nUnhandled++;
-                break;
-            default:
-                nUnhandled++;
-                break;
-        }
+        if (!addVtkCell(mm, cellTypes[ii], nn, &conn[prev], rr)) nUnhandled++;
         prev = cur;
     }
     if (nUnhandled > 0)
@@ -1095,10 +1089,195 @@ static int writeVtu(const char *outputFile, const Mesh &mm)
 }
 
 // ============================================================
+// Legacy VTK (ASCII UnstructuredGrid)
+// ============================================================
+// Reads the classic ASCII layout: POINTS / CELLS (npts id...) / CELL_TYPES,
+// with the first integer CELL_DATA SCALARS field taken as the ref.
+// BINARY legacy VTK is not supported.
+
+static int readVtk(const char *inputFile, Mesh &mm)
+{
+    FILE *fp = fopen(inputFile, "r");
+    if (!fp) { fprintf(stderr, "Cannot open %s\n", inputFile); return 1; }
+
+    // Header: version line, title line, format line (ASCII/BINARY).
+    char line[1024];
+    for (int ii = 0; ii < 3; ii++) {
+        if (!fgets(line, sizeof(line), fp)) {
+            fprintf(stderr, "VTK: truncated header\n"); fclose(fp); return 1;
+        }
+        if (ii == 2 && strstr(line, "BINARY")) {
+            fprintf(stderr, "VTK: BINARY legacy format not supported (use ASCII)\n");
+            fclose(fp); return 1;
+        }
+    }
+
+    std::vector<double> pts;
+    std::vector<int64_t> conn, offsets;
+    std::vector<int> cellTypes, cellRefs;
+    std::string cellRefsName;
+    int sectionCount = 0;   // size of the current CELL_DATA / POINT_DATA section
+    bool inCellData = false;
+
+    char kw[256];
+    while (fscanf(fp, "%255s", kw) == 1) {
+        if (!strcmp(kw, "POINTS")) {
+            int nn; char type[64];
+            if (fscanf(fp, "%d %63s", &nn, type) != 2) break;
+            pts.resize((size_t)nn * 3);
+            for (size_t ii = 0; ii < pts.size(); ii++) fscanf(fp, "%lf", &pts[ii]);
+        } else if (!strcmp(kw, "CELLS")) {
+            int nCells, totalSize;
+            if (fscanf(fp, "%d %d", &nCells, &totalSize) != 2) break;
+            offsets.reserve(nCells);
+            int64_t off = 0;
+            for (int ii = 0; ii < nCells; ii++) {
+                int npts; fscanf(fp, "%d", &npts);
+                for (int kk = 0; kk < npts; kk++) {
+                    long long vv; fscanf(fp, "%lld", &vv);
+                    conn.push_back(vv);
+                }
+                off += npts;
+                offsets.push_back(off);
+            }
+        } else if (!strcmp(kw, "CELL_TYPES")) {
+            int nn; if (fscanf(fp, "%d", &nn) != 1) break;
+            cellTypes.resize(nn);
+            for (int ii = 0; ii < nn; ii++) fscanf(fp, "%d", &cellTypes[ii]);
+        } else if (!strcmp(kw, "CELL_DATA")) {
+            fscanf(fp, "%d", &sectionCount); inCellData = true;
+        } else if (!strcmp(kw, "POINT_DATA")) {
+            fscanf(fp, "%d", &sectionCount); inCellData = false;
+        } else if (!strcmp(kw, "SCALARS")) {
+            char name[256], type[64];
+            if (fscanf(fp, "%255s %63s", name, type) != 2) break;
+            // Optional numComp token then "LOOKUP_TABLE <name>".
+            char tok[256]; fscanf(fp, "%255s", tok);
+            if (strcmp(tok, "LOOKUP_TABLE") != 0) fscanf(fp, "%255s", tok); // skip numComp
+            char tableName[256]; fscanf(fp, "%255s", tableName);
+            bool isInt = strstr(type, "int") || strstr(type, "Int");
+            bool takeAsRef = inCellData && cellRefs.empty() && isInt;
+            for (int ii = 0; ii < sectionCount; ii++) {
+                double vv; fscanf(fp, "%lf", &vv);
+                if (takeAsRef) cellRefs.push_back((int)vv);
+            }
+            if (takeAsRef) cellRefsName = name;
+        } else if (!strcmp(kw, "LOOKUP_TABLE")) {
+            // Standalone color table: skip "<name> <size>" then 4*size floats.
+            char name[256]; int nn;
+            if (fscanf(fp, "%255s %d", name, &nn) == 2)
+                for (int ii = 0; ii < nn * 4; ii++) { double vv; fscanf(fp, "%lf", &vv); }
+        }
+        // Unrecognized keywords (VECTORS, FIELD, etc.) are simply skipped; their
+        // numeric payload is consumed as stray tokens by the outer loop's fscanf.
+    }
+    fclose(fp);
+
+    int nVerts = (int)(pts.size() / 3);
+    mm.x.resize(nVerts); mm.y.resize(nVerts); mm.z.resize(nVerts);
+    for (int ii = 0; ii < nVerts; ii++) {
+        mm.x[ii] = pts[ii*3]; mm.y[ii] = pts[ii*3+1]; mm.z[ii] = pts[ii*3+2];
+    }
+
+    int nCells = (int)cellTypes.size();
+    if ((int)offsets.size() != nCells) {
+        fprintf(stderr, "VTK: CELLS/CELL_TYPES count mismatch (%d vs %d)\n",
+                (int)offsets.size(), nCells);
+        return 1;
+    }
+    bool hasRefs = (int)cellRefs.size() == nCells;
+
+    int64_t prev = 0;
+    int nUnhandled = 0;
+    for (int ii = 0; ii < nCells; ii++) {
+        int64_t cur = offsets[ii];
+        int nn = (int)(cur - prev);
+        int rr = hasRefs ? cellRefs[ii] : 0;
+        if (!addVtkCell(mm, cellTypes[ii], nn, &conn[prev], rr)) nUnhandled++;
+        prev = cur;
+    }
+    if (nUnhandled > 0)
+        fprintf(stderr, "VTK: %d cells of unhandled type/arity ignored\n", nUnhandled);
+
+    printf("VTK: %d verts, %d tri, %d quad, %d tet, %d pyr, %d prism, %d hex%s%s%s\n",
+           mm.nVerts(), mm.nTri(), mm.nQuad(), mm.nTet(),
+           mm.nPyr(), mm.nPrism(), mm.nHex(),
+           hasRefs ? " (refs from '" : "",
+           hasRefs ? cellRefsName.c_str() : "",
+           hasRefs ? "')" : "");
+    return 0;
+}
+
+static int writeVtk(const char *outputFile, const Mesh &mm)
+{
+    FILE *fp = fopen(outputFile, "w");
+    if (!fp) { fprintf(stderr, "Cannot open %s for writing\n", outputFile); return 1; }
+
+    int nCells   = mm.nTri() + mm.nQuad() + mm.nTet() + mm.nPyr() + mm.nPrism() + mm.nHex();
+    int totalConn = 3*mm.nTri() + 4*mm.nQuad() + 4*mm.nTet()
+                  + 5*mm.nPyr() + 6*mm.nPrism() + 8*mm.nHex();
+
+    fprintf(fp, "# vtk DataFile Version 3.0\n");
+    fprintf(fp, "meshConvert output\n");
+    fprintf(fp, "ASCII\n");
+    fprintf(fp, "DATASET UNSTRUCTURED_GRID\n");
+
+    fprintf(fp, "POINTS %d double\n", mm.nVerts());
+    for (int ii = 0; ii < mm.nVerts(); ii++)
+        fprintf(fp, "%.17g %.17g %.17g\n", mm.x[ii], mm.y[ii], mm.z[ii]);
+
+    // CELLS: size field counts the per-cell npts entry plus its vertices.
+    fprintf(fp, "CELLS %d %d\n", nCells, nCells + totalConn);
+    auto dumpConn = [&](const std::vector<int> &cc, int stride) {
+        for (size_t ii = 0; ii < cc.size(); ii += stride) {
+            fprintf(fp, "%d", stride);
+            for (int kk = 0; kk < stride; kk++) fprintf(fp, " %d", cc[ii + kk]);
+            fprintf(fp, "\n");
+        }
+    };
+    dumpConn(mm.triConn,   3);
+    dumpConn(mm.quadConn,  4);
+    dumpConn(mm.tetConn,   4);
+    dumpConn(mm.pyrConn,   5);
+    dumpConn(mm.prismConn, 6);
+    dumpConn(mm.hexConn,   8);
+
+    fprintf(fp, "CELL_TYPES %d\n", nCells);
+    auto dumpType = [&](int tt, int nn) {
+        for (int ii = 0; ii < nn; ii++) fprintf(fp, "%d\n", tt);
+    };
+    dumpType(5,  mm.nTri());
+    dumpType(9,  mm.nQuad());
+    dumpType(10, mm.nTet());
+    dumpType(14, mm.nPyr());
+    dumpType(13, mm.nPrism());
+    dumpType(12, mm.nHex());
+
+    if (nCells > 0) {
+        fprintf(fp, "CELL_DATA %d\n", nCells);
+        fprintf(fp, "SCALARS ref int 1\n");
+        fprintf(fp, "LOOKUP_TABLE default\n");
+        auto dumpRef = [&](const std::vector<int> &rr, int nn) {
+            for (int ii = 0; ii < nn; ii++) fprintf(fp, "%d\n", rr.empty() ? 0 : rr[ii]);
+        };
+        dumpRef(mm.triRef,   mm.nTri());
+        dumpRef(mm.quadRef,  mm.nQuad());
+        dumpRef(mm.tetRef,   mm.nTet());
+        dumpRef(mm.pyrRef,   mm.nPyr());
+        dumpRef(mm.prismRef, mm.nPrism());
+        dumpRef(mm.hexRef,   mm.nHex());
+    }
+
+    fclose(fp);
+    printf("Wrote %s\n", outputFile);
+    return 0;
+}
+
+// ============================================================
 // Dispatch
 // ============================================================
 
-enum Format { FMT_UNKNOWN, FMT_STL, FMT_MESHB, FMT_UGRID, FMT_VTU };
+enum Format { FMT_UNKNOWN, FMT_STL, FMT_MESHB, FMT_UGRID, FMT_VTU, FMT_VTK };
 
 static Format detectFormat(const char *path)
 {
@@ -1106,6 +1285,7 @@ static Format detectFormat(const char *path)
     if (endsWith(path, ".meshb") || endsWith(path, ".mesh"))    return FMT_MESHB;
     if (endsWith(path, ".ugrid"))                               return FMT_UGRID;
     if (endsWith(path, ".vtu"))                                 return FMT_VTU;
+    if (endsWith(path, ".vtk"))                                 return FMT_VTK;
     return FMT_UNKNOWN;
 }
 
@@ -1119,8 +1299,9 @@ static void printUsage(const char *prog)
     printf("  .stl              binary or ASCII STL (surface only)\n");
     printf("  .meshb / .mesh    GMF mesh\n");
     printf("  .ugrid            lb8.ugrid (writes .mapbc companion)\n");
-    printf("  .vtu              VTK UnstructuredGrid (ASCII or inline base64 binary,\n");
+    printf("  .vtu              VTK UnstructuredGrid XML (ASCII or inline base64 binary,\n");
     printf("                    uncompressed; format=\"appended\" / compressed not supported)\n");
+    printf("  .vtk              legacy VTK UnstructuredGrid (ASCII only)\n");
     printf("\n");
     printf("Example: %s model.vtu model.stl\n", prog);
 }
@@ -1147,6 +1328,7 @@ int main(int argc, char *argv[])
         case FMT_MESHB: rr = readMeshb(inFile, mm); break;
         case FMT_UGRID: rr = readUgrid(inFile, mm); break;
         case FMT_VTU:   rr = readVtu  (inFile, mm); break;
+        case FMT_VTK:   rr = readVtk  (inFile, mm); break;
         default: return 1;
     }
     if (rr) return rr;
@@ -1158,6 +1340,7 @@ int main(int argc, char *argv[])
         case FMT_MESHB: rr = writeMeshb(outFile, mm); break;
         case FMT_UGRID: rr = writeUgrid(outFile, mm); break;
         case FMT_VTU:   rr = writeVtu  (outFile, mm); break;
+        case FMT_VTK:   rr = writeVtk  (outFile, mm); break;
         default: return 1;
     }
     return rr;
